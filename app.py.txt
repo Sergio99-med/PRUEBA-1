@@ -2,87 +2,178 @@ import streamlit as st
 import pdfplumber
 import re
 
-# Configuración de la página
-st.set_page_config(page_title="HBL Extractor", page_icon="🏥", layout="centered")
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(page_title="HBL Extractor V4.0 - Interno", page_icon="🧬", layout="centered")
 
-st.title("🏥 Extractor HBL - Sergio")
-st.markdown("Sube el PDF del laboratorio para obtener la evolución lista.")
+st.title("🧬 Extractor HBLT - Sergio's Version")
+st.markdown("""
+### Herramienta para Internado
+Sube los PDFs del **Barros Luco** (Orina, Cultivos, Gram, Bioquímica).
+""")
 
 # --- DICCIONARIO DE ABREVIACIONES ---
+# Mapeo de nombre en PDF -> Nombre corto para tu resumen
 ABREVIACIONES = {
-    "Hemoglobina": "Hb", "Hematocrito": "Hto", "Recuento De Leucocitos": "GB", 
-    "Plaquetas": "Plaq", "Tiempo De Protrombina": "TP", "Tiempo De Tromboplastina": "TTPA", 
-    "Inr": "INR", "Nitrogeno Ureico": "BUN", "Urea": "Urea", "Creatinina": "Crea", 
-    "Sodio": "Na", "Potasio": "K", "Cloro": "Cl", "Proteina C Reactiva": "PCR", 
-    "Acido Urico": "Ac.Urico", "Calcio": "Ca", "Fosforo": "P", "Proteinas Totales": "Prot.Tot", 
-    "Albumina": "Alb", "Ldh": "LDH", "Fosfatasa Alcalina": "FA", "Got/Ast": "GOT", 
-    "Gpt/Alt": "GPT", "Colesterol Total": "Col.Tot", "Bilirrubina Total": "Bili.T", 
-    "Po2": "pO2", "Pco2": "pCO2", "So2": "SatO2", "Hco3": "HCO3", 
-    "Exceso De Base": "BE", "Acido Lactico": "Lactato", "Tco2": "tCO2", "Glucosa": "Glu"
+    # Orina Completa
+    "Glucosuria": "Glu.Orina", "Proteinuria": "Prot.Orina", "Cuerpos Cetonicos": "Cetonas",
+    "Ph Urinario": "pH", "Leucocitos": "Leucos", "Nitritos": "Nitritos",
+    "Eritrocito": "Eritrocitos", "Bacterias": "Bacterias", "Celulas Epiteliales": "Cel.Epit",
+    "Densidad": "Densidad",
+    
+    # Microbiología / General
+    "Vial Aerobio Adulto": "Hemocultivo",
+    "Urocultivo": "Urocultivo",
+    "Tincion De Gram": "Gram",
+    "Staphylococcus Aureus": "S. Aureus",
+    
+    # Antibióticos (para acortar en el resumen)
+    "Clindamicina": "Clinda", "Eritromicina": "Eritro", 
+    "Oxacilina": "Oxacilina", "Rifampicina": "Rifam",
+    "Trimetoprim-Sulfametoxazol": "Cotrimoxazol"
 }
 
-# --- LÓGICA DE EXTRACCIÓN ---
-def procesar_pdf(uploaded_file):
-    resultados_finales = []
-    with pdfplumber.open(uploaded_file) as pdf:
+# Palabras clave para detectar antibiograma y status S/R
+ANTIBIOTICOS_KEY = ["Clindamicina", "Eritromicina", "Oxacilina", "Rifampicina", "Trimetoprim", "Vancomicina", "Ciprofloxacino"]
+
+def limpiar_linea(linea):
+    """Elimina caracteres basura y espacios extra."""
+    linea = linea.replace(':', '').replace('*', '').strip()
+    return linea
+
+def procesar_pdf(archivo_bytes):
+    resultados = []
+    seen = set()
+    antibiograma_encontrado = False
+    
+    with pdfplumber.open(archivo_bytes) as pdf:
         for page in pdf.pages:
-            text = page.extract_text(layout=True)
+            # 1. INTENTO DE EXTRACCIÓN POR TABLAS (Mejor para antibiogramas y orina)
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    # Limpiar None y unir texto
+                    row_clean = [str(cell).strip() for cell in row if cell]
+                    if not row_clean: continue
+                    
+                    # Lógica para Antibiograma (Ej: Clindamicina <=0.25 R)
+                    # Buscamos si el primer elemento es un antibiótico conocido
+                    first_cell = row_clean[0].title()
+                    is_abx = any(abx in first_cell for abx in ANTIBIOTICOS_KEY)
+                    
+                    if is_abx and len(row_clean) >= 2:
+                        # Intentar buscar la S o R en la fila
+                        sensibilidad = "Indet"
+                        if "S" in row_clean: sensibilidad = "S"
+                        elif "R" in row_clean: sensibilidad = "R"
+                        elif "I" in row_clean: sensibilidad = "I"
+                        
+                        # Guardar formato: Clinda(R)
+                        nombre_corto = ABREVIACIONES.get(first_cell, first_cell)
+                        resultados.append(f"{nombre_corto}({sensibilidad})")
+                        antibiograma_encontrado = True
+
+            # 2. EXTRACCIÓN POR TEXTO (Para resultados generales y microbiología)
+            text = page.extract_text(layout=True) # layout=True mantiene la posición espacial
             if not text: continue
+            
             lines = text.split('\n')
             
+            # Variables de estado para bloques de texto multilínea
+            capturando_gram = False
+            
             for line in lines:
-                line = line.replace('*', '').strip()
+                line = limpiar_linea(line)
                 if not line: continue
                 
-                # Filtros de limpieza
-                ignorar = ["Avda", "Carrera", "Teléfono", "Miguel", "Ministerio", "Salud", 
-                           "Hospital", "Barros", "Luco", "RUT", "Paciente", "Solicitante", 
-                           "Validado", "Fecha", "Hora", "Página", "Nota", "Valor", "Critico", 
-                           "Método", "Anterior", "Referencia", "Unidad", "Medida", "Edad", 
-                           "Sexo", "Procedencia", "Bioquimico", "Hematologia", "Coagulacion", "Gases"]
-                
+                # --- FILTROS DE BASURA ---
+                ignorar = ["Hospital", "Barros", "Luco", "RUT", "Paciente", "Validado", "Fecha", "Página", "Firma", "Ministerio", "Salud"]
                 if any(x.upper() in line.upper() for x in ignorar): continue
-                if re.search(r'\d{2}/\d{2}/\d{4}', line): continue
-                palabras_rango = ["Día", "Dia", "Mes", "Año", "Adulto", "Niño", "Semanas"]
-                if any(p in line for p in palabras_rango): continue
+                if re.search(r'\d{2}/\d{2}/\d{4}', line): continue # Fechas
 
-                # Extracción Regex
-                match = re.search(r'^(.+?)\s+([<>]?-?\d+[.,]?\d*)', line)
-                if match:
-                    nombre = match.group(1).strip()
+                # --- LÓGICA MICROBIOLOGÍA ---
+                
+                # A. Urocultivo / Hemocultivo
+                # Detectar frase "Resultado Positivo" o "Resultado Negativo" asociado a cultivo
+                if "Vial Aerobio" in line or "Urocultivo" in line:
+                    # A veces viene "Estudio : Urocultivo" y luego en otra linea el resultado
+                    # Simplificación: Buscar palabras clave en la misma línea o líneas cercanas es complejo sin estado,
+                    # pero en tus PDFs el resultado suele estar cerca.
+                    pass 
+
+                # Si la línea dice explícitamente el resultado del cultivo
+                if line.startswith("Resultado") and ("Positivo" in line or "Negativo" in line):
+                     resultados.append(f"Cultivo {line.replace('Resultado', '').strip()}")
+
+                # B. Identificación del Germen (Ej: Staphylococcus aureus)
+                # Si encontramos un germen común, lo agregamos
+                if "Staphylococcus" in line or "Escherichia" in line or "Klebsiella" in line:
+                    # Limpiamos el nombre
+                    germen = line.replace("1 ", "").strip() # Quitar numeración si existe
+                    # Chequear diccionario
+                    for k, v in ABREVIACIONES.items():
+                        if k.upper() in germen.upper():
+                            germen = v
+                    resultados.append(f"Germen: {germen}")
+
+                # C. Tinción de Gram (Captura narrativa)
+                if "Tincion de Gram" in line:
+                    capturando_gram = True
+                    continue
+                
+                if capturando_gram:
+                    # Asumimos que las siguientes 1-2 líneas son el resultado del Gram
+                    # Hasta encontrar algo que parezca "Validado" o fin de sección
+                    if "Validado" in line or "Dra." in line:
+                        capturando_gram = False
+                    elif len(line) > 5:
+                        resultados.append(f"Gram: {line}")
+                        capturando_gram = False # Captura solo la primera línea relevante
+
+                # --- LÓGICA ORINA COMPLETA Y BIOQUÍMICA (Regex mejorado) ---
+                # Busca: PALABRA (espacio) VALOR (espacio) UNIDAD/TEXTO
+                # Ej: "GLUCOSURIA 100 mg/dL" o "NITRITOS Negativo"
+                
+                # Regex Explicación:
+                # ^([A-Za-z\s]+?) -> Grupo 1: Nombre del examen (letras y espacios al inicio)
+                # \s+             -> Separador obligatorio
+                # (-?\d+[.,]?\d*|Negativo|Positivo|Ambar|Claro|Escasa|Regular|Abundante) -> Grupo 2: Valor numérico o cualitativo
+                
+                match = re.search(r'^([A-Za-z\s/]+?)\s+(-?\d+[.,]?\d*|Negativo|Positivo|Normal|Ambar|Claro|Limpido|Turbio|Escasa|Regular|Abundante)', line, re.IGNORECASE)
+                
+                if match and not antibiograma_encontrado: # Si es antibiograma, no usar este regex
+                    nombre = match.group(1).strip().title()
                     valor = match.group(2).strip()
                     
+                    # Filtros de falsos positivos
                     if len(nombre) < 3: continue
-                    if ":" in nombre and len(nombre) < 5: continue
-                    if re.match(r'^\d', nombre): continue 
-
-                    # Formateo
-                    es_porcentaje = "%" in line
-                    nombre_limpio = nombre.replace("%", "").replace(":", "").strip().title()
-                    nombre_final = ABREVIACIONES.get(nombre_limpio, nombre_limpio)
-                    valor_final = f"{valor}%" if es_porcentaje else valor
+                    if "Solicitud" in nombre or "Procedencia" in nombre: continue
                     
-                    resultados_finales.append(f"{nombre_final} {valor_final}")
-    
-    return " - ".join(resultados_finales)
+                    # Normalización
+                    nombre_final = ABREVIACIONES.get(nombre, nombre)
+                    
+                    # Formatear salida
+                    res_str = f"{nombre_final} {valor}"
+                    if res_str not in seen:
+                        resultados.append(res_str)
+                        seen.add(res_str)
 
-# --- INTERFAZ DE USUARIO ---
-archivo_subido = st.file_uploader("Cargar PDF", type="pdf")
+    # Ordenar y limpiar salida final
+    # Priorizar Cultura y Gram al principio si existen
+    return " // ".join(resultados)
 
-if archivo_subido is not None:
-    try:
-        texto_resultado = procesar_pdf(archivo_subido)
-        
-        if texto_resultado:
-            st.success("✅ ¡Listo!")
-            # Muestra el texto en un bloque de código para copiar fácil
-            st.code(texto_resultado, language=None)
-            st.caption("Presiona el icono de copiar 📄 en la esquina superior derecha del cuadro gris.")
-        else:
-            st.warning("No se encontraron resultados legibles. Verifica que el PDF sea original.")
+# --- INTERFAZ ---
+archivo = st.file_uploader("📂 Sube tu PDF del HBLT", type="pdf")
+
+if archivo:
+    with st.spinner("Analizando con lógica clínica..."):
+        try:
+            texto_extraido = procesar_pdf(archivo)
             
-    except Exception as e:
-        st.error(f"Error al leer el archivo: {e}")
-
-st.markdown("---")
-st.caption("Creado para optimizar el internado - HBL")
+            if texto_extraido:
+                st.success("✅ Datos extraídos")
+                st.text_area("Copia y pega en tu evolución:", value=texto_extraido, height=150)
+            else:
+                st.warning("⚠️ No pude leer datos claros. Verifica que sea un PDF de lab HBLT original.")
+                
+        except Exception as e:
+            st.error(f"Error: {e}")
